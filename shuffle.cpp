@@ -51,6 +51,13 @@ array<vector<vector<uint16_t>>,MAX_INSTRUCTIONS> instr_valid_map;
 array<array<constraint*,512>,MAX_INSTRUCTIONS> instr_constraint_maps;
 // array<unordered_map<pair<uint16_t,uint16_t>,constraint*, hash_pair>,MAX_INSTRUCTIONS> instr_constraint_maps;
 
+vector<array<uint16_t,16>> valid_preimage_1_instr;//For each instr, array of initial preimage_1 per target
+vector<array<uint16_t,16>> valid_preimage_2_instr;
+vector<array<vector<uint16_t>,512>> preimage_update_indices;// Stores vector of values 0-31 representing which preimage mask to update
+vector<array<array<uint16_t,32>,512>> preimage_update_masks;// Stores all update masks(mostly empty probably)(outer indexed using key())
+
+
+
 int instr_binary_point=0;
 int num_instructions =0;
 vector<uint16_t> dag_order(0);
@@ -70,6 +77,10 @@ public:
     vector<array<uint16_t,16>> candidate_locations; //For use in the dataflow v2 thing. 16 indices in array, counting by index in output vector!
     vector<array<uint16_t,16>> valid_preimage_1; //For each output location(length 16), set(or vector) of valid preimage locations.(single node for availability propogation) 
     vector<array<uint16_t,16>> valid_preimage_2; // Same as before, but 2nd predecessor node(in the event of binary)
+
+    vector<array<uint16_t,16>> valid_preimage_1_v2; //For each output location(length 16), set(or vector) of valid preimage locations.(single node for availability propogation) 
+    vector<array<uint16_t,16>> valid_preimage_2_v2; // Same as before, but 2nd predecessor node(in the event of binary)
+    
 
     vector<vector<uint16_t>> update_order; //List of "downstream"(going up DAG) nodes in reverse order 
     
@@ -95,6 +106,8 @@ public:
         candidate_locations = vector<array<uint16_t,16>>(vertices);
         valid_preimage_1 = vector<array<uint16_t,16>>(vertices);
         valid_preimage_2 = vector<array<uint16_t,16>>(vertices);
+        valid_preimage_1_v2 = vector<array<uint16_t,16>>(vertices);
+        valid_preimage_2_v2 = vector<array<uint16_t,16>>(vertices);
         update_order = vector<vector<uint16_t>>(vertices);
         binary_order = vector<uint16_t>(vertices);
         downstream = vector<vector<bool>>(vertices);
@@ -123,6 +136,8 @@ public:
                 candidate_locations[i][j] = 0xFFFF;
                 valid_preimage_1[i][j] = 0xFFFF;
                 valid_preimage_2[i][j] = 0xFFFF;
+                valid_preimage_1_v2[i][j] = 0xFFFF;
+                valid_preimage_2_v2[i][j] = 0xFFFF;
                 path[i][j] = 0xFFFF;
             }
             
@@ -133,6 +148,124 @@ public:
         
 
     }
+    /**
+     * Source is between 0 and 32(for binary instructions)
+     * Target is between 0 and 16.
+     * 
+     * 
+    */
+    void update_preimage(vector<uint16_t*> &undo_locations, vector<uint16_t> &undo_values, uint16_t vertex, uint16_t source, uint16_t target){
+        uint16_t inst  = instructions[vertex];
+        //cout << instr_list[inst].name << source << "," << target<< "\n";
+        for(auto idx : preimage_update_indices[inst][key(source,target)]){
+            if(idx<16){
+                undo_locations.push_back(&valid_preimage_1[vertex][idx]);
+                undo_values.push_back(valid_preimage_1[vertex][idx]);
+                bitset<16> temp1 = valid_preimage_1[vertex][idx];
+                //cout << "Change " << idx << ": " << temp1 << ","; 
+                valid_preimage_1[vertex][idx] &= preimage_update_masks[inst][key(source,target)][idx];
+                bitset<16> temp2 = valid_preimage_1[vertex][idx];
+                //cout << temp2 << "\n"<< flush; 
+                bitset<16> temp3 = preimage_update_masks[inst][key(source,target)][idx];
+                //cout << "Update Mask: " << temp3 << "\n" << flush;
+            }else{
+                undo_locations.push_back(&valid_preimage_2[vertex][idx-16]);
+                undo_values.push_back(valid_preimage_2[vertex][idx-16]);
+                bitset<16> temp1 = valid_preimage_2[vertex][idx];
+                //cout << "Change " << idx << ": " << temp1 << ","; 
+                valid_preimage_2[vertex][idx-16] &= preimage_update_masks[inst][key(source,target)][idx];
+                bitset<16> temp2 = valid_preimage_2[vertex][idx];
+                //cout << temp2 << "\n"<< flush; 
+                bitset<16> temp3 = preimage_update_masks[inst][key(source,target)][idx];
+                //cout << "Update Mask: " << temp3 << "\n" << flush;
+            
+            }
+        }
+        //recalculate_preimage(undo_locations,undo_values,vertex);
+    }
+
+    void initialize_preimage(vector<uint16_t*> &undo_locations, vector<uint16_t> &undo_values,int vertex){
+        uint16_t inst = instructions[vertex];
+        if(inst_type[vertex]){ //Unary
+            for(int target = 0;target < 16; target++){
+                undo_locations.push_back(&valid_preimage_1[vertex][target]);
+                undo_values.push_back(valid_preimage_1[vertex][target]);
+                valid_preimage_1[vertex][target] = valid_preimage_1_instr[inst][target];
+            }
+        }else{//binary
+            for(int target = 0;target < 16; target++){
+                undo_locations.push_back(&valid_preimage_1[vertex][target]);
+                undo_values.push_back(valid_preimage_1[vertex][target]);
+                undo_locations.push_back(&valid_preimage_2[vertex][target]);
+                undo_values.push_back(valid_preimage_2[vertex][target]);
+                valid_preimage_1[vertex][target] = valid_preimage_1_instr[inst][target];
+                valid_preimage_2[vertex][target] = valid_preimage_2_instr[inst][target];
+            }
+        }
+        
+    }
+
+    void assert_preimage_same(int vertex){
+        //cout << "CHECKING";
+        uint16_t inst = instructions[vertex];
+        if(inst_type[vertex]){ //Unary
+            for(int target = 0;target < 16; target++){
+                if(valid_preimage_1_v2[vertex][target] != valid_preimage_1[vertex][target]){
+                    cout << instr_list[inst].name << "," <<vertex << "," << target << ", :\n";
+                    for(int temp=0; temp < 16; temp++)
+                        cout << valid_preimage_1_v2[vertex][temp] << "," << valid_preimage_1[vertex][temp] << "\n" << flush;
+                }
+                assert(valid_preimage_1_v2[vertex][target] ==valid_preimage_1[vertex][target]);
+
+            }
+        }else{//binary
+            for(int target = 0;target < 16; target++){
+                if(valid_preimage_1_v2[vertex][target] != valid_preimage_1[vertex][target]){
+                    cout << instr_list[inst].name << "," <<vertex << "," << target << ", :\n";
+    
+                    for(int temp=0; temp < 16; temp++){
+                        bitset<16> temp1_v2 = valid_preimage_1_v2[vertex][temp];
+                        bitset<16> temp1 = valid_preimage_1[vertex][temp];
+                        cout << temp1_v2 << "," << temp1 << "\n" << flush;
+                    }
+                    for(int temp=0; temp < 16; temp++){
+                        bitset<16> temp2_v2 = valid_preimage_2_v2[vertex][temp];
+                        bitset<16> temp2 = valid_preimage_2[vertex][temp];
+                        cout << temp2_v2 << "," << temp2 << "\n" << flush;
+                    }
+                }
+                assert(valid_preimage_1_v2[vertex][target] ==valid_preimage_1[vertex][target]);
+                if(valid_preimage_2_v2[vertex][target] != valid_preimage_2[vertex][target]){
+                    cout << instr_list[inst].name << "," <<vertex << "," << target << ", :\n";
+                    for(int temp=0; temp < 16; temp++){
+                        bitset<16> temp1_v2 = valid_preimage_1_v2[vertex][temp];
+                        bitset<16> temp1 = valid_preimage_1[vertex][temp];
+                        cout << temp1_v2 << "," << temp1 << "\n" << flush;
+                    }
+                    for(int temp=0; temp < 16; temp++){
+                        bitset<16> temp2_v2 = valid_preimage_2_v2[vertex][temp];
+                        bitset<16> temp2 = valid_preimage_2[vertex][temp];
+                        cout << temp2_v2 << "," << temp2 << "\n" << flush;
+                    }
+                }
+                assert(valid_preimage_2_v2[vertex][target] ==valid_preimage_2[vertex][target]);
+                
+            }
+            // cout << instr_list[inst].name << "," <<vertex << "," << "INFO" << ", :\n";
+            // for(int temp=0; temp < 16; temp++)
+            //     cout << valid_preimage_1_v2[vertex][temp] << "," << valid_preimage_1[vertex][temp] << "\n" << flush;
+            // for(int temp=0; temp < 16; temp++)
+            //     cout << valid_preimage_2_v2[vertex][temp] << "," << valid_preimage_2[vertex][temp] << "\n" << flush;
+        }
+    }
+    /**
+     * Currently VERY slow. Iterates over all constraints and rebuilds the whole preimage bitvector. Use an update based approach
+     * with the changed bits as input and some sort of random access of constraints dependent on changed bits for next iteration.
+     * 
+     * 
+     * 
+     * 
+    */
     void recalculate_preimage(vector<uint16_t*> &undo_locations, vector<uint16_t> &undo_values,int vertex){
         //assert(vertex!=0 && vertex!=1);
         uint16_t inst = instructions[vertex];
@@ -141,19 +274,19 @@ public:
                 if(instr_list[inst].type==0 ){ //Non Mask instruction
                     for(uint16_t target = 0; target < 16; target++){
                         uint16_t temp_val = 0;
-                        //valid_preimage_1[vertex][target] = 0;
+                        //valid_preimage_1_v2[vertex][target] = 0;
                         for(auto source: instr_valid_map[inst][target]){
                             set_bit(temp_val, source);
                         }
-                        if(temp_val!=valid_preimage_1[vertex][target]){
-                            undo_locations.push_back(&valid_preimage_1[vertex][target]);
-                            undo_values.push_back(valid_preimage_1[vertex][target]);
-                            valid_preimage_1[vertex][target] = temp_val;
+                        if(temp_val!=valid_preimage_1_v2[vertex][target]){
+                            undo_locations.push_back(&valid_preimage_1_v2[vertex][target]);
+                            undo_values.push_back(valid_preimage_1_v2[vertex][target]);
+                            valid_preimage_1_v2[vertex][target] = temp_val;
                         }
                     }
                 }else{ //Masked unary instruction
                     for(uint16_t target = 0; target < 16; target++){
-                        //valid_preimage_1[vertex][target] = 0;
+                        //valid_preimage_1_v2[vertex][target] = 0;
                         uint16_t temp_val = 0;
                         for(auto source : instr_valid_map[inst][target]){
                             constraint* temp = instr_constraint_maps[inst][key(source,target)];
@@ -173,10 +306,10 @@ public:
                                 set_bit(temp_val,source);
                             }
                         }
-                        if(temp_val != valid_preimage_1[vertex][target]){
-                            undo_locations.push_back(&valid_preimage_1[vertex][target]);
-                            undo_values.push_back(valid_preimage_1[vertex][target]);
-                            valid_preimage_1[vertex][target] = temp_val;
+                        if(temp_val != valid_preimage_1_v2[vertex][target]){
+                            undo_locations.push_back(&valid_preimage_1_v2[vertex][target]);
+                            undo_values.push_back(valid_preimage_1_v2[vertex][target]);
+                            valid_preimage_1_v2[vertex][target] = temp_val;
                         }
                     }
                 }
@@ -185,15 +318,15 @@ public:
             if(instructions[vertex]!=0xFFFF){
                 if(instr_list[inst].type==3){ //Non-masked instruction
                     for(uint16_t target = 0; target < 16; target++){
-                        // undo_locations.push_back(&valid_preimage_1[vertex][target]);
-                        // undo_values.push_back(valid_preimage_1[vertex][target]);
+                        // undo_locations.push_back(&valid_preimage_1_v2[vertex][target]);
+                        // undo_values.push_back(valid_preimage_1_v2[vertex][target]);
                         
-                        // undo_locations.push_back(&valid_preimage_2[vertex][target]);
-                        // undo_values.push_back(valid_preimage_2[vertex][target]);
+                        // undo_locations.push_back(&valid_preimage_2_v2[vertex][target]);
+                        // undo_values.push_back(valid_preimage_2_v2[vertex][target]);
                         uint16_t temp_val_1 = 0;
                         uint16_t temp_val_2 = 0;
-                        // valid_preimage_1[vertex][target] = 0;
-                        // valid_preimage_2[vertex][target] = 0;
+                        // valid_preimage_1_v2[vertex][target] = 0;
+                        // valid_preimage_2_v2[vertex][target] = 0;
                         for(auto source: instr_valid_map[inst][target]){
                             if(source<16){
                                 set_bit(temp_val_1,source);
@@ -202,29 +335,29 @@ public:
                                 set_bit(temp_val_2,source%16);
                             }
                         }
-                        if(temp_val_1 != valid_preimage_1[vertex][target]){
-                            undo_locations.push_back(&valid_preimage_1[vertex][target]);
-                            undo_values.push_back(valid_preimage_1[vertex][target]);
-                            valid_preimage_1[vertex][target] = temp_val_1;
+                        if(temp_val_1 != valid_preimage_1_v2[vertex][target]){
+                            undo_locations.push_back(&valid_preimage_1_v2[vertex][target]);
+                            undo_values.push_back(valid_preimage_1_v2[vertex][target]);
+                            valid_preimage_1_v2[vertex][target] = temp_val_1;
                         }
-                        if(temp_val_2 != valid_preimage_2[vertex][target]){
-                            undo_locations.push_back(&valid_preimage_2[vertex][target]);
-                            undo_values.push_back(valid_preimage_2[vertex][target]);
-                            valid_preimage_2[vertex][target] = temp_val_2;
+                        if(temp_val_2 != valid_preimage_2_v2[vertex][target]){
+                            undo_locations.push_back(&valid_preimage_2_v2[vertex][target]);
+                            undo_values.push_back(valid_preimage_2_v2[vertex][target]);
+                            valid_preimage_2_v2[vertex][target] = temp_val_2;
                         }
                     }
                 }else{ //Masked instruction
                     for(uint16_t target = 0; target < 16; target++){
-                        // undo_locations.push_back(&valid_preimage_1[vertex][target]);
-                        // undo_values.push_back(valid_preimage_1[vertex][target]);
+                        // undo_locations.push_back(&valid_preimage_1_v2[vertex][target]);
+                        // undo_values.push_back(valid_preimage_1_v2[vertex][target]);
                         
-                        // undo_locations.push_back(&valid_preimage_2[vertex][target]);
-                        // undo_values.push_back(valid_preimage_2[vertex][target]);
+                        // undo_locations.push_back(&valid_preimage_2_v2[vertex][target]);
+                        // undo_values.push_back(valid_preimage_2_v2[vertex][target]);
 
                         uint16_t temp_val_1 = 0;
                         uint16_t temp_val_2 = 0;
-                        // valid_preimage_1[vertex][target] = 0;
-                        // valid_preimage_2[vertex][target] = 0;
+                        // valid_preimage_1_v2[vertex][target] = 0;
+                        // valid_preimage_2_v2[vertex][target] = 0;
 
                         for(auto source : instr_valid_map[inst][target]){
                             constraint* temp = instr_constraint_maps[inst][key(source,target)];
@@ -251,27 +384,39 @@ public:
                                 }
                             }
                         }
-                        if(temp_val_1 != valid_preimage_1[vertex][target]){
-                            undo_locations.push_back(&valid_preimage_1[vertex][target]);
-                            undo_values.push_back(valid_preimage_1[vertex][target]);
-                            valid_preimage_1[vertex][target] = temp_val_1;
+                        if(temp_val_1 != valid_preimage_1_v2[vertex][target]){
+                            undo_locations.push_back(&valid_preimage_1_v2[vertex][target]);
+                            undo_values.push_back(valid_preimage_1_v2[vertex][target]);
+                            valid_preimage_1_v2[vertex][target] = temp_val_1;
                         }
-                        if(temp_val_2 != valid_preimage_2[vertex][target]){
-                            undo_locations.push_back(&valid_preimage_2[vertex][target]);
-                            undo_values.push_back(valid_preimage_2[vertex][target]);
-                            valid_preimage_2[vertex][target] = temp_val_2;
+                        if(temp_val_2 != valid_preimage_2_v2[vertex][target]){
+                            undo_locations.push_back(&valid_preimage_2_v2[vertex][target]);
+                            undo_values.push_back(valid_preimage_2_v2[vertex][target]);
+                            valid_preimage_2_v2[vertex][target] = temp_val_2;
                         }
                     }
                 }
             }
         }
+        assert_preimage_same(vertex);
         // cout << "PreImages:\n";
         // for(int i =0;i<16;i++){
-        //     bitset<16> temp(valid_preimage_1[vertex][i]);
-        //     bitset<16> temp2(valid_preimage_2[vertex][i]);
+        //     bitset<16> temp(valid_preimage_1_v2[vertex][i]);
+        //     bitset<16> temp2(valid_preimage_2_v2[vertex][i]);
         //     cout << temp << "," << temp2 << "\n";
         // }
     }
+    /**
+     * Update candidate locations bitvectors. Note that for current byte, only nodes downstream of the currently enumerated vertex
+     * should be updated!(Fixes issues with other paths filling the bitvector when we should have committed to current path only!)
+     * 
+     * For all subsequent bytes, this does not apply. For both cases, only need to update nodes downstream of currently enumerated vertex
+     * (For cur_byte only use data downstream of current vertex, for others can use off-path as well.)
+     * 
+     * 
+     * 
+     * 
+    */
     void update_candidate_locations_good(vector<uint16_t*> &undo_locations, 
                                     vector<uint16_t> &undo_values,
                                     uint16_t vertex,
@@ -374,7 +519,11 @@ public:
         }
     }
 }
-
+/**
+ * Old broken version of candidate_update. Falls into pitfall from above.
+ * 
+ * 
+*/
 void update_candidate_locations(vector<uint16_t*> &undo_locations, 
                                     vector<uint16_t> &undo_values,
                                     uint16_t vertex,
@@ -426,6 +575,12 @@ void update_candidate_locations(vector<uint16_t*> &undo_locations,
             }
         }
     }
+    /**
+     * Check validity of availability bitvectors. Important to also check if desired input node downstream of current vertex for current byte.
+     * In case of stray offpath, the propogation will not reach(or update) the input node, so it will stay mostly 1's.
+     * 
+     * 
+    */
     bool check_valid(vector<uint16_t*> &undo_locations, vector<uint16_t> &undo_values,shuffle_val &desired, uint16_t cur_vertex,uint16_t cur_byte){
         bool valid = true;
         for(uint16_t i=0; i < 16; i++){
@@ -634,6 +789,7 @@ void update_candidate_locations(vector<uint16_t*> &undo_locations,
 
     }
 };
+
 vector<DAG> dags;
 uint32_t dag_vertices_to_index[MAX_VERTICES+1];
 void read_dags(uint16_t max_depth){
@@ -693,12 +849,116 @@ uint64_t timeSinceEpochMillisec() {
   using namespace std::chrono;
   return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
+void precompute_invalid_assignments(){
+    for(int i =0; i < num_instructions; i++){
+        instr inst = instr_list[i];
+        if(inst.type==0 || inst.type==3)
+            continue;
+        for(uint16_t target1 = 0; target1< 16; target1++){//Iterate over first constraint
+            for(uint16_t source1: instr_valid_map[i][target1]){
+                array<uint16_t,32> preimage_update;
+                for(int tmp = 0;tmp < 16; tmp++){
+                    preimage_update[tmp] = valid_preimage_1_instr[i][tmp];
+                    bitset<16> temp = valid_preimage_1_instr[i][tmp];
+                    // if(inst.name=="_mm_blend_epi32")
+                    //     cout << "SETTING input 1," <<target1 << "," <<temp << "\n";
+                }
+                for(int tmp=16;tmp<32;tmp++){
+                    preimage_update[tmp] = valid_preimage_2_instr[i][tmp-16];
+                    bitset<16> temp = valid_preimage_2_instr[i][tmp-16];
+                    // if(inst.name=="_mm_blend_epi32")
+                    //     cout << "SETTING input 2," <<target1 << "," <<temp << "\n";
+                }
+                constraint* constr_1 = instr_constraint_maps[i][key(source1,target1)];
+                array<uint16_t,128> mask_vals1;
+                for(int tmp = 0;tmp < 128; tmp++){
+                    mask_vals1[tmp] = 2;
+                }
+                for(auto val: constr_1->map){
+                    uint16_t loc = constraint_loc(val);
+                    uint16_t set_value = constraint_val(val);
+                    mask_vals1[loc] = set_value;
+                }
+
+                for(uint16_t target2 = 0; target2 < 16; target2++){//Iterate over 2nd constraint
+                    for(uint16_t source2: instr_valid_map[i][target2]){
+                        if(target1==target2 && source1==source2)
+                            continue;
+                        constraint* constr_2 = instr_constraint_maps[i][key(source2,target2)];
+                        bool valid = true;
+                        for(auto val: constr_2->map){
+                            uint16_t loc = constraint_loc(val);
+                            uint16_t set_value = constraint_val(val);
+                            uint16_t current_value = mask_vals1[loc];
+                            if(current_value!=2 && current_value!=set_value){
+                                valid = false;
+                                break;
+                            }
+                        }
+                        if(!valid){
+                            if(source2<16){
+                                clear_bit(preimage_update[target2],source2);
+                            }else{
+                                clear_bit(preimage_update[target2+16],source2-16);
+                            }
+                        }
+                        
+                    }
+                }
+                for(int tmp = 0; tmp < 32; tmp++){
+                    preimage_update_masks[i][key(source1,target1)][tmp] = preimage_update[tmp];
+                    bitset<16> temp = preimage_update[tmp];
+                    // if(inst.name=="_mm_blend_epi32")
+                    //     cout <<"FINAL " << tmp << "," << temp << "\n" << flush;
+                    if(preimage_update[tmp] !=0xFFFF){
+                        preimage_update_indices[i][key(source1,target1)].push_back(tmp);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void precompute_preimages(){
+    for(int i =0; i < num_instructions; i++){
+        instr inst = instr_list[i];
+        if(inst.type <3){
+            for(uint16_t target = 0; target < 16; target++){
+                    uint16_t temp_val = 0;
+                    //valid_preimage_1[vertex][target] = 0;
+                    for(auto source: instr_valid_map[i][target]){
+                        set_bit(temp_val, source);
+                    }
+                    valid_preimage_1_instr[i][target] = temp_val;
+                }
+        }else{
+            for(uint16_t target = 0; target < 16; target++){
+                uint16_t temp_val_1 = 0;
+                uint16_t temp_val_2 = 0;
+                for(auto source: instr_valid_map[i][target]){
+                    if(source<16){
+                        set_bit(temp_val_1,source);
+                    }
+                    else{
+                        set_bit(temp_val_2,source%16);
+                    }
+                }
+                valid_preimage_1_instr[i][target] = temp_val_1;
+                valid_preimage_2_instr[i][target] = temp_val_2;
+            }
+        }
+    }
+}
 void read_constraints(){
     ifstream read_file("constraint_data4.txt");
     uint32_t num_insts;
     read_file >> num_insts;
 
     num_instructions = num_insts;
+    valid_preimage_1_instr = vector<array<uint16_t,16>>(num_insts);
+    valid_preimage_2_instr = vector<array<uint16_t,16>>(num_insts);
+    preimage_update_indices = vector<array<vector<uint16_t>,512>>(num_insts);
+    preimage_update_masks = vector<array<array<uint16_t,32>,512>>(num_insts);
 
     for(int i =0; i < num_insts;i++){
         instr_valid_map[i] = vector<vector<uint16_t>>(16);
@@ -706,6 +966,12 @@ void read_constraints(){
         for(int j =0;j<16;j++){
             instr_valid_map[i][j]=vector<uint16_t>(0);
             instr_valid_map[i][j].reserve(16);
+            valid_preimage_1_instr[i][j] = 0;
+            valid_preimage_1_instr[i][j] = 0;
+        }
+        for(int j =0; j < 512;j ++){
+            preimage_update_indices[i][j] = vector<uint16_t>(0);
+            preimage_update_indices[i][j].reserve(32);
         }
     }
     for(int i = 0; i < num_insts; i++){
@@ -755,10 +1021,13 @@ void read_constraints(){
 
 
     }
+    precompute_preimages();
+    precompute_invalid_assignments();
 
 
 
 }
+
 bool backtracking_recursive(shuffle_val &desired,
                             vector<uint16_t> &byte_order,
                             uint16_t byte_index,
@@ -778,7 +1047,7 @@ bool unary_nomask_new(shuffle_val &desired,
     //assert(__builtin_popcount(dag.candidate_locations[cur_vertex][cur_byte])==1);
     uint16_t cur_loc = __builtin_ctz(dag.candidate_locations[cur_vertex][cur_byte]);
     uint16_t vertex_1 = dag.reverse_edges[cur_vertex][0];
-    dag.recalculate_preimage(undo_locations,undo_values,cur_vertex);
+    //dag.recalculate_preimage(undo_locations,undo_values,cur_vertex);
     if(__builtin_popcount(dag.valid_preimage_1[cur_vertex][cur_loc])<1){
         return false;
     }
@@ -834,7 +1103,8 @@ bool unary_mask_new(shuffle_val &desired,
                 dag.mask_values[cur_vertex][loc] = set_val;
             }
         }
-        dag.recalculate_preimage(undo_locations,undo_values,cur_vertex);
+        dag.update_preimage(undo_locations,undo_values,cur_vertex,source_opt,cur_loc);
+        //dag.recalculate_preimage(undo_locations,undo_values, cur_vertex);
         dag.update_candidate_locations_good(undo_locations,undo_values,cur_vertex, byte_order, byte_index,vertex_1,source_opt);
         if(dag.check_valid(undo_locations,undo_values,desired, vertex_1, cur_byte)){
             if(backtracking_recursive(desired, byte_order, byte_index, vertex_1, depth+1,dag)){
@@ -874,7 +1144,7 @@ bool binary_nomask_new(shuffle_val &desired,
             __builtin_unreachable();
         }
         uint16_t next_vertex;
-        dag.recalculate_preimage(undo_locations,undo_values,cur_vertex);
+        //dag.recalculate_preimage(undo_locations,undo_values,cur_vertex);
         if(__builtin_popcount(dag.valid_preimage_1[cur_vertex][cur_loc]==0)){
             //assert(__builtin_popcount(dag.valid_preimage_2[cur_vertex][cur_loc])==1); //vertex 2
             uint16_t prev_loc = __builtin_ctz(dag.valid_preimage_2[cur_vertex][cur_loc]);
@@ -979,7 +1249,8 @@ bool binary_mask_new(shuffle_val &desired,
         undo_locations.push_back(&dag.path[cur_vertex][cur_byte]);
         undo_values.push_back(dag.path[cur_vertex][cur_byte]);
         dag.path[cur_vertex][cur_byte] = vertex_1;
-        dag.recalculate_preimage(undo_locations,undo_values,cur_vertex);
+        dag.update_preimage(undo_locations,undo_values,cur_vertex,source_opt,cur_loc);
+        //dag.recalculate_preimage(undo_locations,undo_values, cur_vertex);
         dag.update_candidate_locations_good(undo_locations,undo_values,cur_vertex, byte_order, byte_index, vertex_1, source_opt);
         if(dag.check_valid(undo_locations,undo_values,desired, vertex_1, cur_byte)){
             if(backtracking_recursive(desired, byte_order, byte_index, vertex_1, depth+1,dag)){
@@ -1016,10 +1287,12 @@ bool binary_mask_new(shuffle_val &desired,
         undo_locations.push_back(&dag.path[cur_vertex][cur_byte]);
         undo_values.push_back(dag.path[cur_vertex][cur_byte]);
         dag.path[cur_vertex][cur_byte] = vertex_2;
-        dag.recalculate_preimage(undo_locations,undo_values,cur_vertex);
+        dag.update_preimage(undo_locations,undo_values,cur_vertex,source_opt+16,cur_loc);
+        //dag.recalculate_preimage(undo_locations,undo_values, cur_vertex);
         dag.update_candidate_locations_good(undo_locations,undo_values,cur_vertex, byte_order, byte_index, vertex_2, source_opt);
         if(dag.check_valid(undo_locations,undo_values,desired, vertex_2, cur_byte)){
             if(backtracking_recursive(desired, byte_order, byte_index, vertex_2, depth+1,dag)){
+                //cout << undo_values.size() << "\n" << flush;
                 return true;
             }
         }
@@ -1055,7 +1328,8 @@ bool backtracking_recursive(shuffle_val &desired,
                             DAG &dag 
 ){
     uint16_t cur_byte = byte_order[byte_index];
-    //cout << byte_order.size() << "," << byte_index << "," << depth << "," << cur_vertex << "\n" << flush;
+    // if(byte_index==byte_order.size()-1)
+    //     cout << byte_order.size() << "," << byte_index << "," << depth << "," << cur_vertex << "\n" << flush;
 
     //Diagnostics
     // for(int i =0; i < byte_index; i++){
@@ -1233,6 +1507,8 @@ bool backtracking_recursive(shuffle_val &desired,
                 //     cout << i << "\n" << flush;
                 //cout << "VERTEX NUM: " << cur_vertex << ", " << i << "\n" << flush;
                 dag.instructions[cur_vertex] = i;
+
+
                 instr inst = instr_list[i];
                 
                 if(inst.type==0){
@@ -1243,6 +1519,7 @@ bool backtracking_recursive(shuffle_val &desired,
                     undo_locations.push_back(&dag.path[cur_vertex][cur_byte]);
                     undo_values.push_back(dag.path[cur_vertex][cur_byte]);
                     dag.path[cur_vertex][cur_byte] = vertex_1;
+                    dag.initialize_preimage(undo_locations,undo_values,cur_vertex);
                     if(unary_nomask_new(desired, byte_order, byte_index, depth, dag, cur_vertex, cur_byte))
                         return true;
                     else{
@@ -1259,7 +1536,8 @@ bool backtracking_recursive(shuffle_val &desired,
                     undo_locations.push_back(&dag.path[cur_vertex][cur_byte]);
                     undo_values.push_back(dag.path[cur_vertex][cur_byte]);
                     dag.path[cur_vertex][cur_byte] = vertex_1;
-                    dag.recalculate_preimage(undo_locations,undo_values,cur_vertex);
+                    dag.initialize_preimage(undo_locations,undo_values,cur_vertex);
+                    //dag.recalculate_preimage(undo_locations,undo_values,cur_vertex);
                     if(unary_mask_new(desired, byte_order, byte_index, depth, dag, cur_vertex, cur_byte))
                         return true;
                     for(int i = 0; i < undo_locations.size(); i++){
@@ -1277,12 +1555,19 @@ bool backtracking_recursive(shuffle_val &desired,
                 //cout << "VERTEX NUM: " << cur_vertex << ", " << i << "\n" << flush;
                 
                 dag.instructions[cur_vertex] = i;
+
                 instr inst = instr_list[i];
                 //cout << inst.name << "\n" << flush;
                 if(inst.type==3){
                     //cout << "Entered case 2 binary 3" << inst.name << "\n" << flush;
+                    vector<uint16_t*> undo_locations;
+                    vector<uint16_t> undo_values;
+                    dag.initialize_preimage(undo_locations,undo_values,cur_vertex);
                     if(binary_nomask_new(desired, byte_order, byte_index, depth, dag, cur_vertex, cur_byte))
                         return true;
+                    for(int i = 0; i < undo_locations.size(); i++){
+                        *undo_locations[i] = undo_values[i];
+                    }
 
                 }else if(inst.type==4 || inst.type==5){
                     //cout << "Entered case 2 binary 4/5" << inst.name << "\n" << flush;
@@ -1290,7 +1575,8 @@ bool backtracking_recursive(shuffle_val &desired,
                     vector<uint16_t> undo_values;
                     undo_locations.push_back(&dag.binary_order[cur_vertex]);
                     undo_values.push_back(2);
-                    dag.recalculate_preimage(undo_locations,undo_values,cur_vertex);
+                    dag.initialize_preimage(undo_locations,undo_values,cur_vertex);
+                    //dag.recalculate_preimage(undo_locations,undo_values,cur_vertex);
                     for(uint16_t binary_ordering = 0; binary_ordering < 2; binary_ordering++){
                         dag.binary_order[cur_vertex] = binary_ordering;
                         
@@ -1416,14 +1702,14 @@ void backtracking_old(shuffle_val desired){
 
 
 int main(int argc, char** argv){
-    uint16_t max_depth =3;
+    uint16_t max_depth =5;
     read_constraints();
     //cout << "Finished reading constraints\n" << flush;
     read_dags(max_depth);
     //cout << "Finished reading dags\n" << flush;
 
     for(int i =0; i < num_instructions;i++){
-        //cout << i << ":" << instr_list[i].type << "," << instr_list[i].name << "," <<instr_list[i].constraint_length <<"\n";
+        cout << i << ":" << instr_list[i].type << "," << instr_list[i].name << "," <<instr_list[i].constraint_length <<"\n";
     }
     for(int i  =0; i < dag_vertices_to_index[max_depth+3];i++){
         DAG dag = dags[i];
